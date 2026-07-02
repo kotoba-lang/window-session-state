@@ -1,6 +1,298 @@
 (ns os-test
+  "Test suite for the restored `os` (kami-os) namespaces.
+
+  The original Rust crate (kami-engine/kami-os, deleted in
+  kotoba-lang/kami-engine PR #82) had zero `#[test]` functions in any of
+  its 9 source files (verified by grepping the pre-deletion tree at
+  a8368f9c0d784dbc9d11e8fa8f407aa95c7ce4fa) — so there is nothing to
+  port 1:1. Instead this suite provides original coverage of every
+  ported pure function across all modules, plus the pre-existing
+  namespace-loads smoke test."
   (:require [clojure.test :refer [deftest is testing]]
-            [os]))
+            [os]
+            [os.window :as window]
+            [os.compositor :as compositor]
+            [os.input-router :as input-router]
+            [os.taskbar :as taskbar]
+            [os.launcher :as launcher]
+            [os.notification :as notification]
+            [os.terminal :as terminal]
+            [os.file-explorer :as file-explorer]))
+
 (deftest namespace-loads
   (testing "the restored CLJC namespace loads"
-    (is (some? os))))
+    (is (some? (the-ns 'os)))))
+
+;; ── os.window ────────────────────────────────────
+
+(deftest window-component-from-config-test
+  (let [cfg (window/window-config {:app-id "app1" :title "Files" :x 10 :y 20 :w 300 :h 200
+                                    :content window/file-explorer-content})
+        comp (window/window-component-from-config cfg)]
+    (is (= "app1" (:app-id comp)))
+    (is (= "Files" (:title comp)))
+    (is (= :normal (:state comp)))
+    (is (= window/file-explorer-content (:content comp)))
+    (is (= 0 (:z-order comp)))))
+
+(deftest window-rect-contains-test
+  (let [rect (window/window-rect {:x 0 :y 0 :w 100 :h 100})]
+    (is (window/rect-contains? rect 50 50))
+    (is (window/rect-contains? rect 0 0))
+    (is (window/rect-contains? rect 100 100))
+    (is (not (window/rect-contains? rect 101 50)))
+    (is (not (window/rect-contains? rect 50 -1)))))
+
+(deftest window-rect-title-bar-contains-test
+  (let [rect (window/window-rect {:x 0 :y 0 :w 100 :h 100})]
+    (is (window/title-bar-contains? rect 50 0))
+    (is (window/title-bar-contains? rect 50 32.0))
+    (is (not (window/title-bar-contains? rect 50 33.0)))
+    (is (not (window/title-bar-contains? rect 101 10)))))
+
+;; ── os.compositor ────────────────────────────────
+
+(deftest compositor-bring-to-front-test
+  (let [c (compositor/compositor-state)
+        c (compositor/bring-to-front c 1)
+        c (compositor/bring-to-front c 2)
+        c (compositor/bring-to-front c 3)]
+    (is (= [3 2 1] (compositor/z-stack c)))
+    (is (= 3 (compositor/focused-window c)))
+    ;; re-focusing an existing window moves it to front without duplicating
+    (let [c (compositor/bring-to-front c 1)]
+      (is (= [1 3 2] (compositor/z-stack c)))
+      (is (= 1 (compositor/focused-window c))))))
+
+(deftest compositor-remove-test
+  (let [c (compositor/compositor-state)
+        c (compositor/bring-to-front c 1)
+        c (compositor/bring-to-front c 2)
+        c (compositor/remove-window c 2)]
+    (is (= [1] (compositor/z-stack c)))
+    (is (= 1 (compositor/focused-window c))))
+  (testing "removing a non-focused window doesn't change focus"
+    (let [c (compositor/compositor-state)
+          c (compositor/bring-to-front c 1)
+          c (compositor/bring-to-front c 2)
+          c (compositor/remove-window c 1)]
+      (is (= [2] (compositor/z-stack c)))
+      (is (= 2 (compositor/focused-window c)))))
+  (testing "removing the last window clears focus"
+    (let [c (compositor/compositor-state)
+          c (compositor/bring-to-front c 1)
+          c (compositor/remove-window c 1)]
+      (is (= [] (compositor/z-stack c)))
+      (is (nil? (compositor/focused-window c))))))
+
+(deftest compositor-drag-test
+  (let [c (compositor/compositor-state)]
+    (is (nil? (compositor/update-drag c 10 10)))
+    (let [c (compositor/start-drag c 42 5 5)]
+      (is (= [42 15 25] (compositor/update-drag c 20 30)))
+      (let [c (compositor/end-drag c)]
+        (is (nil? (compositor/update-drag c 20 30)))))))
+
+(deftest compositor-usable-height-test
+  (is (= (- compositor/default-desktop-height compositor/default-taskbar-height)
+         (compositor/usable-height (compositor/compositor-state)))))
+
+;; ── os.input-router ──────────────────────────────
+
+(deftest input-router-resolve-target-test
+  (let [ir (input-router/input-router-state)]
+    (is (= [:none] (input-router/resolve-target ir)))
+    (let [ir (input-router/set-focus ir 7)]
+      (is (= [:panel 7] (input-router/resolve-target ir)))
+      (is (= 7 (input-router/focused ir)))
+      (let [ir (input-router/set-consent-modal ir true)]
+        (is (= [:modal input-router/consent-modal-id] (input-router/resolve-target ir)))
+        (let [ir (input-router/set-consent-modal ir false)]
+          (is (= [:panel 7] (input-router/resolve-target ir)))))
+      (let [ir (input-router/set-launcher ir true)]
+        (is (= [:global-overlay] (input-router/resolve-target ir)))))))
+
+(deftest input-router-clear-focus-if-test
+  (let [ir (-> (input-router/input-router-state) (input-router/set-focus 1))]
+    (is (nil? (:focused (input-router/clear-focus-if ir 1))))
+    (is (= 1 (:focused (input-router/clear-focus-if ir 2))))))
+
+;; ── os.taskbar ───────────────────────────────────
+
+(deftest taskbar-state-test
+  (let [t (taskbar/taskbar-state)
+        entry (taskbar/agent-status-entry {:did "did:1" :name "agent" :status :active})]
+    (is (= [] (:agents t)))
+    (let [t (taskbar/update-agents t [entry])]
+      (is (= [entry] (:agents t))))
+    (let [t (taskbar/update-budget t "42 GCC")]
+      (is (= "42 GCC" (:budget-display t))))
+    (let [t (taskbar/update-consent-count t 3)]
+      (is (= 3 (:pending-consent-count t))))
+    (let [t (taskbar/toggle-launcher t)]
+      (is (:launcher-open t))
+      (is (not (:launcher-open (taskbar/toggle-launcher t)))))))
+
+;; ── os.launcher ──────────────────────────────────
+
+(defn- app [name] (launcher/launcher-app {:app-id name :name name :icon "x"
+                                           :description (str name " app") :domain (str name ".com")
+                                           :running false}))
+
+(deftest launcher-toggle-test
+  (let [l (-> (launcher/launcher-state)
+              (assoc :search-query "abc" :selected-index 2))
+        l (launcher/toggle l)]
+    (is (:visible l))
+    (is (= "" (:search-query l)))
+    (is (= 0 (:selected-index l)))
+    (let [l (launcher/toggle l)]
+      (is (not (:visible l))))))
+
+(deftest launcher-filtered-apps-test
+  (let [l (assoc (launcher/launcher-state) :apps [(app "Terminal") (app "Files") (app "Chat")])]
+    (is (= 3 (count (launcher/filtered-apps l))))
+    (let [l (assoc l :search-query "fil")]
+      (is (= ["Files"] (mapv :name (launcher/filtered-apps l)))))
+    (let [l (assoc l :search-query "app")]
+      (is (= 3 (count (launcher/filtered-apps l)))))))
+
+(deftest launcher-select-prev-next-test
+  (let [l (assoc (launcher/launcher-state) :apps [(app "A") (app "B") (app "C")])]
+    (is (= 0 (:selected-index (launcher/select-prev l))))
+    (let [l (launcher/select-next l)]
+      (is (= 1 (:selected-index l)))
+      (let [l (-> l launcher/select-next launcher/select-next)]
+        (is (= 2 (:selected-index l)))))))
+
+;; ── os.notification ──────────────────────────────
+
+(deftest notification-toast-tick-test
+  (let [q (notification/notification-queue)
+        q (notification/push-toast! q "hi" "body" :info 100)]
+    (is (= 1 (count (:toasts (:toasts q)))))
+    (let [q (notification/tick q 50)]
+      (is (= 1 (count (:toasts (:toasts q)))))
+      (let [q (notification/tick q 60)]
+        (is (= 0 (count (:toasts (:toasts q)))))))))
+
+(deftest notification-consent-test
+  (let [q (notification/notification-queue)
+        req (notification/consent-request {:agent-did "did:1" :agent-name "a"
+                                            :action "write" :risk-tier "high"
+                                            :estimated-cost 1.5 :context-json "{}"})
+        [q id] (notification/push-consent q req)]
+    (is (= 1 id))
+    (is (= id (:id (notification/active-consent q))))
+    (let [q (notification/resolve-consent q id :approved)]
+      (is (nil? (notification/active-consent q)))
+      (is (= [[id :approved]] (:consent-responses q))))))
+
+;; ── os.terminal ──────────────────────────────────
+
+(deftest terminal-submit-test
+  (let [t (assoc (terminal/terminal-state) :input "help")
+        [t cmd] (terminal/submit t)]
+    (is (= "help" cmd))
+    (is (= ["help"] (:history t)))
+    (is (= "" (:input t)))
+    (is (= 0 (:cursor t)))
+    (is (some #(= (:text %) "> help") (:output t)))))
+
+(deftest terminal-history-navigation-test
+  (let [t (terminal/terminal-state)
+        [t _] (terminal/submit (assoc t :input "one"))
+        [t _] (terminal/submit (assoc t :input "two"))
+        t (terminal/history-up t)]
+    (is (= "two" (:input t)))
+    (let [t (terminal/history-up t)]
+      (is (= "one" (:input t)))
+      ;; at oldest, stays
+      (let [t (terminal/history-up t)]
+        (is (= "one" (:input t)))
+        (let [t (terminal/history-down t)]
+          (is (= "two" (:input t)))
+          (let [t (terminal/history-down t)]
+            (is (= "" (:input t)))
+            (is (nil? (:history-index t)))))))))
+
+(deftest terminal-append-output-test
+  (let [t (terminal/terminal-state)
+        t (terminal/append-output t "line1\nline2" :output)]
+    (is (some #(= (:text %) "line1") (:output t)))
+    (is (some #(= (:text %) "line2") (:output t)))))
+
+(deftest terminal-trim-scrollback-test
+  (let [t (assoc (terminal/terminal-state) :max-scrollback 3 :output [])
+        t (reduce (fn [t line] (terminal/append-output t line :output))
+                   t ["a" "b" "c" "d" "e"])]
+    (is (= 3 (count (:output t))))
+    (is (= ["c" "d" "e"] (mapv :text (:output t))))))
+
+;; ── os.file-explorer ─────────────────────────────
+
+(deftest file-explorer-navigate-test
+  (let [fe (file-explorer/file-explorer-state)
+        fe (assoc fe :entries [1 2] :selected [0])
+        fe (file-explorer/navigate fe "/docs")]
+    (is (= "/docs" (:current-path fe)))
+    (is (= [] (:entries fe)))
+    (is (= [] (:selected fe)))))
+
+(deftest file-explorer-navigate-up-test
+  (let [fe (assoc (file-explorer/file-explorer-state) :current-path "/docs/sub")
+        fe (file-explorer/navigate-up fe)]
+    (is (= "/docs" (:current-path fe)))
+    (let [fe (file-explorer/navigate-up fe)]
+      (is (= "/" (:current-path fe)))
+      ;; navigate-up at root is a no-op
+      (let [fe (file-explorer/navigate-up fe)]
+        (is (= "/" (:current-path fe)))))))
+
+(deftest file-explorer-select-test
+  (let [entries [(file-explorer/file-entry {:name "a" :path "/a" :kind :file})
+                 (file-explorer/file-entry {:name "b" :path "/b" :kind :file})]
+        fe (assoc (file-explorer/file-explorer-state) :entries entries)
+        fe (file-explorer/toggle-select fe 0)]
+    (is (= [0] (:selected fe)))
+    (is (= [(first entries)] (file-explorer/selected-entries fe)))
+    (let [fe (file-explorer/toggle-select fe 0)]
+      (is (= [] (:selected fe))))))
+
+;; ── os (top-level desktop orchestration) ─────────
+
+(deftest os-open-close-focus-window-test
+  (let [d (os/os-desktop)
+        cfg (window/window-config {:app-id "app1" :title "T" :x 0 :y 0 :w 10 :h 10
+                                    :content window/terminal-content})
+        [d id] (os/open-window d cfg)]
+    (is (contains? (:windows d) id))
+    (is (= id (compositor/focused-window (:compositor d))))
+    (is (= id (input-router/focused (:input-router d))))
+    (let [[d2 id2] (os/open-window d cfg)]
+      (is (= [id2 id] (compositor/z-stack (:compositor d2))))
+      (let [d3 (os/focus-window d2 id)]
+        (is (= [id id2] (compositor/z-stack (:compositor d3))))))
+    (let [d (os/close-window d id)]
+      (is (not (contains? (:windows d) id)))
+      (is (nil? (compositor/focused-window (:compositor d)))))))
+
+(deftest os-notification-helpers-test
+  (let [d (os/os-desktop)
+        d (os/show-notification d "Hi" "body" :info)]
+    (is (= 1 (count (:toasts (:toasts (:notifications d))))))
+    (let [req (notification/consent-request {:agent-did "did:1" :agent-name "a"
+                                              :action "write" :risk-tier "low"
+                                              :estimated-cost 0.0 :context-json "{}"})
+          [d id] (os/show-consent-modal d req)]
+      (is (= 1 id))
+      (is (= id (:id (notification/active-consent (:notifications d))))))))
+
+(deftest os-advance-test
+  (let [d (os/os-desktop)
+        [d ticks] (os/advance d os/default-tick-ns)]
+    (is (= 1 ticks))
+    (is (= 1 (:ticks (:clock d))))
+    (let [[d ticks] (os/advance d 0)]
+      (is (= 0 ticks))
+      (is (= 1 (:ticks (:clock d)))))))
